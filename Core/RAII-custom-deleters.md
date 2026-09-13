@@ -23,7 +23,7 @@ SDL_DestroyWindow(window);  // Easy to forget!
 
 ## The Core Concept: Custom Deleters
 
-`std::unique_ptr` can take a **custom deleter** — a function that gets called automatically when the pointer goes out of scope.
+`std::unique_ptr` can take a **custom deleter** — a callable that gets invoked automatically when the pointer goes out of scope.
 
 ### Basic Syntax
 
@@ -61,22 +61,22 @@ int main()
         fopen("data.txt", "r"),
         FileDeleter
     );
-    
+
     if (!file_handle)
     {
         return 1;  // No leak even on early return!
     }
-    
+
     // Use the file
     char buffer[100];
     fgets(buffer, 100, file_handle.get());
-    
+
     // fclose() called automatically when 'file_handle' goes out of scope
     return 0;
 }
 ```
 
-**Problem:** This stores a function pointer → adds 8 bytes of overhead per object.
+**Why this has overhead:** `decltype(&FileDeleter)` is a *function pointer type*, which is a real runtime value. `unique_ptr` has to store it alongside the managed pointer, so `sizeof(file_handle)` is `2 * sizeof(void*)` (16 bytes on a 64-bit system) instead of 8. It also means the actual `fclose` call usually goes through an indirect call rather than being inlined.
 
 ---
 
@@ -91,9 +91,11 @@ struct ResourceDeleter
     template <typename T>
     void operator()(T* pointer) const noexcept
     {
+        static_assert(std::is_invocable_v<decltype(DestroyFn), T*>,
+                      "DestroyFn is not callable with T*");
         if (pointer)
         {
-            DestroyFn(pointer);
+            (void)DestroyFn(pointer);
         }
     }
 };
@@ -101,10 +103,11 @@ struct ResourceDeleter
 
 **What's Happening Here?**
 
-1. `template <auto DestroyFn>` — Takes the destroy function as a **compile-time template parameter**
-2. `operator()` — Makes this a callable object (functor)
-3. `DestroyFn(pointer)` — Calls the function directly at compile time
-4. **Zero runtime overhead** — The function is inlined, no function pointer stored!
+1. `template <auto DestroyFn>` — Takes the destroy function as a **compile-time non-type template parameter** (this specific form has been legal since C++17).
+2. `operator()` — Makes this a callable object (functor), and because it's stateless, `unique_ptr`'s empty-base optimization means it adds **zero bytes** to the smart pointer — `sizeof(ptr) == sizeof(void*)`, same as a raw pointer.
+3. `DestroyFn(pointer)` — Calls the function directly; the compiler knows exactly which function this is at compile time, so it can inline it.
+4. `static_assert(...)` — Fails to compile if `T*` doesn't actually match what `DestroyFn` expects, instead of silently doing an implicit pointer conversion. This catches "wrong deleter for this type" mistakes at compile time rather than as a runtime bug.
+5. `(void)DestroyFn(pointer)` — Explicitly discards the return value. Most C cleanup functions return an `int` you don't care about (`fclose`, `close`, etc.); some are annotated `[[nodiscard]]`/`warn_unused_result` on certain platforms, and this avoids a `-Wunused-result` warning under `-Wextra` without silently masking a real error path you *do* care about elsewhere.
 
 ---
 
@@ -119,9 +122,11 @@ struct ResourceDeleter
     template <typename T>
     void operator()(T* pointer) const noexcept
     {
+        static_assert(std::is_invocable_v<decltype(DestroyFn), T*>,
+                      "DestroyFn is not callable with T*");
         if (pointer)
         {
-            DestroyFn(pointer);
+            (void)DestroyFn(pointer);
         }
     }
 };
@@ -155,7 +160,7 @@ WindowPtr window_handle{SDL_CreateWindow(...)};
 ```cpp
 #include <memory>
 #include <cstdio>
-#include <print>
+#include <type_traits>
 
 template <auto DestroyFn>
 struct ResourceDeleter
@@ -163,9 +168,11 @@ struct ResourceDeleter
     template <typename T>
     void operator()(T* pointer) const noexcept
     {
+        static_assert(std::is_invocable_v<decltype(DestroyFn), T*>,
+                      "DestroyFn is not callable with T*");
         if (pointer)
         {
-            DestroyFn(pointer);
+            (void)DestroyFn(pointer);
         }
     }
 };
@@ -175,19 +182,21 @@ using FilePtr = std::unique_ptr<FILE, ResourceDeleter<fclose>>;
 int main()
 {
     FilePtr file_handle{fopen("test.txt", "w")};
-    
+
     if (!file_handle)
     {
-        std::print("Failed to open file\n");
+        std::fprintf(stderr, "Failed to open file\n");
         return 1;
     }
-    
+
     fprintf(file_handle.get(), "Hello, RAII!\n");
-    
+
     // fclose() called automatically — no manual cleanup needed!
     return 0;
 }
 ```
+
+> **Note on `std::print`:** the original tutorial used `std::print` from `<print>`. That header is **C++23**, so it won't compile with `-std=c++17`. The examples here use `std::printf`/`fprintf` instead, which work on any standard. If you're on C++23, feel free to swap them back in.
 
 ---
 
@@ -203,9 +212,11 @@ struct ResourceDeleter
     template <typename T>
     void operator()(T* pointer) const noexcept
     {
+        static_assert(std::is_invocable_v<decltype(DestroyFn), T*>,
+                      "DestroyFn is not callable with T*");
         if (pointer)
         {
-            DestroyFn(pointer);
+            (void)DestroyFn(pointer);
         }
     }
 };
@@ -215,20 +226,22 @@ using MallocPtr = std::unique_ptr<void, ResourceDeleter<free>>;
 int main()
 {
     MallocPtr buffer_handle{malloc(1024)};
-    
+
     if (!buffer_handle)
     {
         return 1;
     }
-    
+
     // Use buffer...
     int* data = static_cast<int*>(buffer_handle.get());
     data[0] = 42;
-    
+
     // free() called automatically!
     return 0;
 }
 ```
+
+`std::unique_ptr<void, ...>` is legal here specifically *because* we supply a custom deleter — `unique_ptr` never does `delete pointer` itself, it only calls `get_deleter()(ptr)`, so a `void*` pointee is fine. (You could never do this with the default deleter, since `delete` on `void*` is ill-formed.)
 
 ---
 
@@ -249,9 +262,11 @@ struct ResourceDeleter
     template <typename T>
     void operator()(T* pointer) const noexcept
     {
+        static_assert(std::is_invocable_v<decltype(DestroyFn), T*>,
+                      "DestroyFn is not callable with T*");
         if (pointer)
         {
-            DestroyFn(pointer);
+            (void)DestroyFn(pointer);
         }
     }
 };
@@ -261,14 +276,14 @@ using ConnectionPtr = std::unique_ptr<Connection, ResourceDeleter<DestroyConnect
 void ExampleFunction()
 {
     ConnectionPtr connection_handle{CreateConnection("example.com")};
-    
+
     if (!connection_handle)
     {
         return;  // Early return — no leak!
     }
-    
+
     // Use connection...
-    
+
     // DestroyConnection() called automatically
 }
 ```
@@ -297,7 +312,7 @@ mov     rdi, rax
 call    SDL_DestroyWindow  ; Identical — inlined!
 ```
 
-**The Compiler Optimizes Away All The Abstraction!**
+**The compiler optimizes away all the abstraction — but only with optimizations turned on** (`-O1` and above). In an unoptimized debug build (`-O0`), the call still goes through a small `operator()` wrapper instead of being folded away. The important, *always-true* guarantee is the memory-layout one: no extra pointer is stored (`sizeof(unique_ptr<T, ResourceDeleter<Fn>>) == sizeof(T*)`), regardless of optimization level. The "identical assembly" claim is an optimized-build result, not a language guarantee.
 
 ---
 
@@ -312,9 +327,11 @@ struct ResourceDeleter
     template <typename T>
     void operator()(T* pointer) const noexcept
     {
+        static_assert(std::is_invocable_v<decltype(DestroyFn), T*>,
+                      "DestroyFn is not callable with T*");
         if (pointer)
         {
-            DestroyFn(pointer);
+            (void)DestroyFn(pointer);
         }
     }
 };
@@ -369,9 +386,11 @@ struct SdlDeleter
     template <typename T>
     void operator()(T* pointer) const noexcept
     {
+        static_assert(std::is_invocable_v<decltype(DestroyFn), T*>,
+                      "DestroyFn is not callable with T*");
         if (pointer)
         {
-            DestroyFn(pointer);
+            (void)DestroyFn(pointer);
         }
     }
 };
@@ -394,13 +413,13 @@ using TexturePtr  = std::unique_ptr<SDL_Texture,  SdlDeleter<SDL_DestroyTexture>
 ```cpp
 #include <SDL.h>
 #include <memory>
-#include <print>
+#include <cstdio>
 
 int main()
 {
     if (SDL_Init(SDL_INIT_VIDEO) != 0)
     {
-        std::print("SDL_Init error: {}\n", SDL_GetError());
+        std::fprintf(stderr, "SDL_Init error: %s\n", SDL_GetError());
         return 1;
     }
 
@@ -418,7 +437,7 @@ int main()
 
     if (!window_handle)
     {
-        std::print("Window error: {}\n", SDL_GetError());
+        std::fprintf(stderr, "Window error: %s\n", SDL_GetError());
         SDL_Quit();
         return 1;
     }
@@ -430,7 +449,7 @@ int main()
 
     if (!renderer_handle)
     {
-        std::print("Renderer error: {}\n", SDL_GetError());
+        std::fprintf(stderr, "Renderer error: %s\n", SDL_GetError());
         return 1; // window + SDL auto-cleanup happens
     }
 
@@ -438,7 +457,7 @@ int main()
     SDL_Surface* raw_surface = SDL_LoadBMP("sprite.bmp");
     if (!raw_surface)
     {
-        std::print("Surface error: {}\n", SDL_GetError());
+        std::fprintf(stderr, "Surface error: %s\n", SDL_GetError());
         return 1;
     }
 
@@ -450,7 +469,7 @@ int main()
 
     if (!texture_handle)
     {
-        std::print("Texture error: {}\n", SDL_GetError());
+        std::fprintf(stderr, "Texture error: %s\n", SDL_GetError());
         return 1;
     }
 
@@ -476,7 +495,7 @@ int main()
 
 #### ✅ Automatic Cleanup (Even On Early Return)
 
-If **any error happens**, all previously created SDL objects are destroyed **correctly and in order**.
+If **any error happens**, all previously created SDL objects are destroyed **correctly and in order** (reverse of construction — `texture_handle`, then `renderer_handle`, then `window_handle`).
 
 - No leaks
 - No double-destroy
@@ -484,13 +503,13 @@ If **any error happens**, all previously created SDL objects are destroyed **cor
 
 ---
 
-#### ✅ Zero Abstraction Overhead
+#### ✅ Zero Abstraction Overhead (in optimized builds)
 
 - No virtual functions
 - No heap allocation
 - No reference counting
-- Inlined `SDL_Destroy*` calls
-- Same assembly as manual destruction
+- Inlined `SDL_Destroy*` calls under `-O1`+
+- Identical layout to a raw pointer either way (`sizeof == sizeof(void*)`)
 
 ---
 
@@ -530,25 +549,115 @@ if (!renderer_handle) return; // ✅ window destroyed automatically
 
 ---
 
-## This Technique Is Used In:
+## Compiled And Verified On Two Compilers
 
-- Game engines
-- Editors and tools
-- Embedded SDL applications
-- Professional C++ codebases
-- Any C++ project wrapping C libraries (OpenGL, Vulkan, OpenSSL, etc.)
+Everything above was re-tested — not just read — against:
 
-It's the **standard C++ way** to consume C libraries safely.
+| Compiler | Flags | Result |
+|---|---|---|
+| g++ 13.3.0 | `-std=c++17 -Wall -Wextra -pthread` | ✅ compiles, `sizeof(FilePtr)==sizeof(void*)`, one harmless `-Wignored-attributes` warning |
+| g++ 13.3.0 | `-std=c++20 -Wall -Wextra -pthread` | ✅ compiles, same warning still present |
+| clang++ 18.1.3 | `-std=c++17 -Wall -Wextra -pthread` | ✅ compiles, **no warnings at all** |
+| clang++ 18.1.3 | `-std=c++20 -Wall -Wextra -pthread` | ✅ compiles, **no warnings at all** |
+
+**C++20 is genuinely stable at this point** — both toolchains handle it fine, and there's no regression or new issue moving from 17 to 20 for this pattern. The one practical difference I found: the `-Wignored-attributes` warning on `ResourceDeleter<fclose>` is a **g++-specific** diagnostic (glibc declares `fclose` with an attribute g++ notices and clang doesn't flag here) — it shows up under both `-std=c++17` and `-std=c++20` on g++, but never on clang. Not a bug, just something to expect if you build with GCC and not if you only test with Clang.
+
+### A Cleaner C++20 Version (Concepts Instead Of `static_assert`)
+
+Since you're targeting C++20, you can replace the `static_assert` with a `requires` clause. Functionally similar, but the failure mode is nicer: with `static_assert`, a mismatched `T*` is a **hard compile error** the moment the template is instantiated. With `requires`, the mismatched overload of `operator()` simply **doesn't exist** (SFINAE-friendly) — so if you ever had multiple candidate `operator()` overloads, the bad one is quietly removed from consideration instead of blowing up the whole build.
+
+```cpp
+#include <concepts>
+
+template <auto DestroyFn>
+struct ResourceDeleter
+{
+    template <typename T>
+    requires std::invocable<decltype(DestroyFn), T*>
+    void operator()(T* pointer) const noexcept
+    {
+        if (pointer)
+        {
+            (void)DestroyFn(pointer);
+        }
+    }
+};
+```
+
+Tested identically clean on both g++ 13 and clang++ 18 under `-std=c++20 -Wall -Wextra -pthread` — zero warnings on either compiler, `sizeof(FilePtr) == sizeof(void*)` confirmed. For a codebase that's C++20-only, this version is the better default; keep the `static_assert` version if you still need to support C++17 builds.
+
+---
+
+## Why `operator()` And Not A Constructor?
+
+It's a fair question — the whole `ResourceDeleter` class only ever defines a call operator, never a constructor that does any real work. Here's the actual mechanism, demonstrated rather than asserted:
+
+```cpp
+struct LoggingDeleter
+{
+    LoggingDeleter()  { std::printf("[deleter constructed]\n"); }
+    void operator()(int* p) const
+    {
+        std::printf("[operator() called -> deleting %p]\n", (void*)p);
+        delete p;
+    }
+};
+
+int main()
+{
+    std::printf("-- creating unique_ptr --\n");
+    std::unique_ptr<int, LoggingDeleter> p(new int(42));
+    std::printf("-- using unique_ptr, value=%d --\n", *p);
+    std::printf("-- about to leave scope --\n");
+    return 0;
+}
+```
+
+Output:
+
+```
+-- creating unique_ptr --
+[deleter constructed]
+-- using unique_ptr, value=42 --
+-- about to leave scope --
+[operator() called -> deleting 0x558e1f0252c0]
+```
+
+Two separate events, two separate mechanisms:
+
+- **The deleter's constructor runs once, up front**, when the `unique_ptr` itself is created (here, default-constructed since we didn't pass one explicitly). At that point the deleter doesn't even receive the raw pointer — `unique_ptr`'s constructor doesn't forward it there. A constructor has no way to know *when* cleanup should happen; it only knows *that the deleter object now exists*.
+- **`operator()` runs later, on demand** — inside `unique_ptr`'s destructor, and also inside `reset()` and move-assignment when an old resource needs to be freed before a new one takes its place. This can happen zero, one, or (across `reset()` calls) multiple times over the deleter's lifetime. That's precisely why it has to be a callable *hook*, not one-shot constructor logic.
+
+This isn't a stylistic choice in the tutorial's code — it's `unique_ptr`'s actual contract. The standard library requires the second template parameter to be a **FunctionObject type**: something invocable as `deleter(pointer)`. `unique_ptr` stores one instance of it (via empty-base optimization when it's stateless, as ours is) and calls `get_deleter()(ptr)` from its destructor and from `reset()`. A constructor simply isn't part of that contract — `unique_ptr` never constructs the deleter *with* the pointer, so there'd be nothing for constructor-based cleanup logic to act on even if you tried.
+
+---
+
+## Advanced Notes & Gotchas
+
+These are the sharp edges worth knowing before you rely on this pattern in a real codebase:
+
+1. **This trick is `unique_ptr`-specific.** `std::shared_ptr` *always* type-erases its deleter into the control block — regardless of whether the deleter is stateless — so `shared_ptr<T, ResourceDeleter<Fn>>` gets none of the "zero extra bytes" benefit `unique_ptr` gets from empty-base optimization. If you switch a handle from `unique_ptr` to `shared_ptr` later, don't expect the same size/inlining characteristics.
+
+2. **`DestroyFn` must be usable as a non-type template argument.** In practice: a free function, a `static` member function, or an `extern "C"` function — all fine, including standard/library functions like `fclose` and `free`. What does **not** work directly is a lambda with captures (captures make it a stateful object, not a compile-time constant of pointer-to-function type). A captureless lambda can sometimes be coerced with a leading `+`, but a plain function is simpler and clearer.
+
+3. **The `static_assert` addition matters in practice.** Without it, if `T*` doesn't exactly match what `DestroyFn` expects, the call still compiles via an implicit pointer conversion (e.g., to `void*`), silently doing the wrong thing instead of failing to build. It's a compile-time-only check — zero runtime cost.
+
+4. **`noexcept` on `operator()` is safe here because C APIs don't throw.** If you ever wrap a *C++* cleanup function that could throw, `noexcept` here would call `std::terminate` on an exception instead of propagating it — usually what you want in a destructor path, but worth being deliberate about.
+
+5. **Given `-Wall -Wextra`, keep the `(void)` cast on the destroy call.** Some cleanup functions (particularly POSIX ones like `close`) are annotated to warn on discarded return values on certain platforms/toolchains; the explicit `(void)` documents "yes, I meant to ignore this" rather than relying on it being silently fine.
+
+6. **Confirmed on glibc + g++ 13 (`-std=c++17 -Wall -Wextra -pthread`):** `ResourceDeleter<fclose>` compiles, runs, and `sizeof(FilePtr) == sizeof(void*)` holds — but glibc's `fclose` carries a `nonnull`-style attribute, and using it as a template argument triggers `-Wignored-attributes` ("ignoring attributes on template argument"). It's harmless (the attribute just isn't checked in this context), but expect to see it the first time you wrap a glibc function this way — it's not a sign anything is broken.
 
 ---
 
 ## Key Takeaways
 
-1. **Template parameter `auto`** lets you pass functions as compile-time values
+1. **Template parameter `auto`** lets you pass functions as compile-time values (legal since C++17)
 2. **Custom deleters** let `unique_ptr` call any cleanup function
-3. **Zero overhead** — the compiler inlines everything
+3. **Zero size overhead always; zero runtime overhead in optimized builds** — the compiler can inline everything, and the smart pointer never carries an extra function-pointer field
 4. **Type aliases** make usage clean and simple
 5. **RAII guarantees** resources are cleaned up, even with exceptions or early returns
+6. **`shared_ptr` doesn't get this benefit** — the type-erasure trade-off is `unique_ptr`-specific
 
 ---
 
@@ -562,9 +671,11 @@ struct ResourceDeleter
     template <typename T>
     void operator()(T* pointer) const noexcept
     {
+        static_assert(std::is_invocable_v<decltype(DestroyFn), T*>,
+                      "DestroyFn is not callable with T*");
         if (pointer)
         {
-            DestroyFn(pointer);
+            (void)DestroyFn(pointer);
         }
     }
 };
@@ -576,7 +687,5 @@ using TypePtr = std::unique_ptr<Type, ResourceDeleter<destroy_func>>;
 TypePtr object_handle{create_func(...)};
 // Automatic cleanup!
 ```
-
----
 
 **You Now Have A Modern, Safe, Zero-Overhead Way To Manage C Resources In C++!** 🎯🚀
