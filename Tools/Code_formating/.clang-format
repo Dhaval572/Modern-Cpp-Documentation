@@ -15,4 +15,5 @@ BreakBeforeBraces: Allman
 IndentWidth: 4
 NamespaceIndentation: All
 TabWidth: 4
-AlignConsecutiveAssignments: true
+AlignConsecutiveAssignments: 
+  Enabled: true
